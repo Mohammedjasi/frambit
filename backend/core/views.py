@@ -1,0 +1,1059 @@
+import datetime
+from decimal import Decimal
+from django.contrib.auth.models import User
+from django.db.models import Q
+from django.shortcuts import get_object_or_404
+
+from rest_framework import status, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied as DRFPermissionDenied
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+from rest_framework.permissions import (
+    AllowAny,
+    IsAuthenticated,
+)
+from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
+from rest_framework.views import APIView
+
+from .media_services import ImageKitService
+
+from .models import (
+    CreatorCategory,
+    UserProfile,
+    ShooterProfile,
+    Package,
+    PortfolioPhoto,
+    Availability,
+    Booking,
+    Review,
+    SavedShooter,
+    PromotionalBanner,
+)
+
+from .serializers import (
+    CreatorCategorySerializer,
+    UserProfileSerializer,
+    ShooterProfileSerializer,
+    PackageSerializer,
+    PortfolioPhotoSerializer,
+    AvailabilitySerializer,
+    BookingSerializer,
+    ReviewSerializer,
+    SavedShooterSerializer,
+    PromotionalBannerSerializer,
+)
+
+
+from .permissions import (
+    IsCustomer,
+    IsShooter,
+)
+
+from .services import (
+    calculate_booking_amount,
+    update_shooter_rating,
+    increment_shooter_bookings,
+)
+
+
+def get_or_create_client_profile(client_email, client_name="Client"):
+    """
+    Safely find or create a client User and UserProfile by email.
+    Guarantees no duplicate User records with the same email.
+    """
+    client_email = (client_email or "guest@frambit.com").strip().lower()
+    user = User.objects.filter(email__iexact=client_email).first() or User.objects.filter(username=client_email).first()
+    if not user:
+        desired_username = client_email[:150]
+        username = desired_username
+        c = 1
+        while User.objects.filter(username=username).exists():
+            username = f"{desired_username[:140]}_{c}"
+            c += 1
+        user = User.objects.create(
+            username=username,
+            email=client_email,
+            first_name=client_name[:150] if client_name else "Client"
+        )
+    profile, _ = UserProfile.objects.get_or_create(
+        user=user,
+        defaults={"role": "customer"}
+    )
+    return profile
+
+
+class CreatorSyncView(APIView):
+    """
+    Public endpoint — syncs a creator's profile from the frontend (Firebase auth)
+    into the Django DB so they appear on the home page for all clients.
+
+    POST /api/creators/sync/
+    Body: { email, display_name, bio, city, area, hourly_price,
+            phone, category, avatar_url, equipment, shooting_styles,
+            experience_years, instagram_handle, is_available }
+    """
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'sync'
+
+    def post(self, request):
+        data = request.data
+        email = data.get("email", "").strip().lower()
+        display_name = data.get("display_name") or data.get("name") or "Creator"
+
+        if not email:
+            return Response({"detail": "email is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 1. Get or create Django User from email safely
+        user = User.objects.filter(email__iexact=email).first()
+        if not user:
+            username = email.split("@")[0].replace(".", "_").replace("+", "_")[:150]
+            base_user = username
+            c = 1
+            while User.objects.filter(username=username).exists():
+                username = f"{base_user[:140]}_{c}"
+                c += 1
+            user = User.objects.create(
+                email=email,
+                username=username,
+                first_name=display_name.split()[0] if display_name else ""
+            )
+        # Keep display name in sync
+        if user.first_name != display_name:
+            user.first_name = display_name
+            user.save(update_fields=["first_name"])
+
+        # 2. Get or create UserProfile
+        user_profile, _ = UserProfile.objects.get_or_create(
+            user=user,
+            defaults={"role": "shooter", "phone": data.get("phone", ""), "city": data.get("city", "")},
+        )
+        user_profile.role = "shooter"
+        user_profile.phone = data.get("phone", user_profile.phone)
+        user_profile.city = data.get("city", user_profile.city)
+        if data.get("avatar_url"):
+            user_profile.profile_image = data["avatar_url"][:500] if len(data["avatar_url"]) < 500 else ""
+        user_profile.save()
+
+        # 3. Clean instagram handle
+        raw_insta = str(data.get("instagram_handle") or data.get("instagram") or "").strip()
+        clean_insta = raw_insta.replace("https://www.instagram.com/", "").replace("https://instagram.com/", "").replace("http://instagram.com/", "").strip("/").lstrip("@")
+
+        # 4. Get or create ShooterProfile
+        shooter_defaults = {
+            "display_name": display_name,
+            "category": data.get("category", "reel_shooter") or "reel_shooter",
+            "bio": data.get("bio", ""),
+            "city": data.get("city", ""),
+            "area": data.get("area", ""),
+            "instagram_handle": clean_insta,
+            "hourly_price": data.get("hourly_price", 0) or 0,
+            "equipment": data.get("equipment", ""),
+            "shooting_styles": data.get("shooting_styles", []) or [],
+            "packages": data.get("packages", []) or [],
+            "portfolio": data.get("portfolio", []) or [],
+            "experience_years": int(data.get("experience_years", 0) or 0),
+            "is_available": data.get("is_available", True),
+            "is_verified": False,
+        }
+        shooter, created = ShooterProfile.objects.get_or_create(
+            user=user_profile,
+            defaults=shooter_defaults,
+        )
+        if not created:
+            # Update existing record
+            for field, value in shooter_defaults.items():
+                setattr(shooter, field, value)
+            shooter.save()
+
+        return Response({
+            "id": shooter.id,
+            "display_name": shooter.display_name,
+            "created": created,
+            "message": "Creator profile synced successfully.",
+        }, status=status.HTTP_200_OK)
+
+
+class UserRoleLookupView(APIView):
+    """
+    Public lookup endpoint to determine a user's role (creator vs customer) and
+    retrieve their creator/profile details by email or authenticated Firebase token.
+    Used by the frontend to guarantee that creators like yy@gmail.com are accurately
+    routed to the Creator Dashboard upon login.
+    """
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'sync'
+
+    def get(self, request):
+        email = request.query_params.get("email", "").strip().lower()
+        if not email and request.user and request.user.is_authenticated:
+            email = getattr(request.user, "email", "").strip().lower()
+        return self._lookup(email)
+
+    def post(self, request):
+        email = request.data.get("email", "").strip().lower()
+        if not email and request.user and request.user.is_authenticated:
+            email = getattr(request.user, "email", "").strip().lower()
+        return self._lookup(email)
+
+    def _lookup(self, email):
+        if not email:
+            return Response({"detail": "email is required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # 1. Look up User and UserProfile
+        user = User.objects.filter(email__iexact=email).first()
+        profile = getattr(user, "profile", None) if user else None
+
+        # 2. Look up ShooterProfile (via profile relation or directly by email)
+        shooter = None
+        if profile and hasattr(profile, "shooter_profile"):
+            shooter = profile.shooter_profile
+        elif profile and profile.role == "shooter":
+            shooter = ShooterProfile.objects.filter(user=profile).first()
+        else:
+            shooter = ShooterProfile.objects.filter(user__user__email__iexact=email).first()
+
+        is_creator = False
+        if (profile and profile.role == "shooter") or (shooter is not None):
+            is_creator = True
+
+        if is_creator:
+            serializer = ShooterProfileSerializer(shooter) if shooter else None
+            shooter_data = serializer.data if serializer else {}
+            display_name = shooter.display_name if shooter else (user.first_name or "Creator")
+            return Response({
+                "email": email,
+                "role": "creator",
+                "is_creator": True,
+                "shooter_id": shooter.id if shooter else None,
+                "display_name": display_name,
+                "name": display_name,
+                "phone": (profile.phone if profile else "") or shooter_data.get("phone", ""),
+                "city": (shooter.city if shooter else "") or (profile.city if profile else ""),
+                "area": (shooter.area if shooter else "") or "",
+                "bio": (shooter.bio if shooter else "") or "",
+                "category": (shooter.category if shooter else "") or "reel_shooter",
+                "avatar": (profile.profile_image if profile and profile.profile_image else "") or shooter_data.get("avatar", ""),
+                "hourly_price": float(shooter.hourly_price) if shooter else 799,
+                "instagram_handle": (shooter.instagram_handle if shooter else "") or shooter_data.get("instagram_handle", ""),
+                "equipment": (shooter.equipment if shooter else "") or "",
+                "shooting_styles": shooter.shooting_styles if shooter else [],
+                "packages": shooter_data.get("packages", []) if shooter_data else [],
+                "portfolio": shooter_data.get("portfolio", []) if shooter_data else [],
+                "shooter": shooter_data,
+            }, status=status.HTTP_200_OK)
+
+        if profile and profile.role == "customer":
+            return Response({
+                "email": email,
+                "role": "user",
+                "is_creator": False,
+                "display_name": user.get_full_name() or user.username or "Client",
+                "name": user.get_full_name() or user.username or "Client",
+                "phone": profile.phone or "",
+                "city": profile.city or "",
+                "avatar": profile.profile_image or "",
+            }, status=status.HTTP_200_OK)
+
+        return Response({
+            "email": email,
+            "role": "user",
+            "is_creator": False,
+            "display_name": user.get_full_name() or user.username if user else "",
+            "name": user.get_full_name() or user.username if user else "",
+            "phone": profile.phone if profile else "",
+            "city": profile.city if profile else "",
+            "avatar": profile.profile_image if (profile and profile.profile_image) else "",
+        }, status=status.HTTP_200_OK)
+
+
+class UserSyncView(APIView):
+    """
+    Public endpoint to sync client/customer and user profile details (including avatar ImageKit URL,
+    display name, phone, city) to User and UserProfile.
+    POST /api/users/sync/
+    """
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'sync'
+
+    def post(self, request):
+        data = request.data
+        email = (data.get("email") or "").strip().lower()
+        if not email:
+            return Response({"detail": "email is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        display_name = (data.get("display_name") or data.get("name") or "").strip()
+        avatar = (data.get("avatar") or data.get("avatar_url") or data.get("profile_image") or "").strip()
+        phone = (data.get("phone") or "").strip()
+        city = (data.get("city") or "").strip()
+        raw_role = (data.get("role") or "customer").strip().lower()
+        role = "shooter" if raw_role in ["creator", "shooter"] else "customer"
+
+        user = User.objects.filter(email__iexact=email).first()
+        if not user:
+            username = email.split("@")[0].replace(".", "_")[:140]
+            base_u = username
+            c = 1
+            while User.objects.filter(username=username).exists():
+                username = f"{base_u}_{c}"
+                c += 1
+            user = User.objects.create(
+                email=email,
+                username=username,
+                first_name=display_name[:150] if display_name else email.split("@")[0]
+            )
+        elif display_name and user.first_name != display_name:
+            user.first_name = display_name[:150]
+            user.save(update_fields=["first_name"])
+
+        profile, _ = UserProfile.objects.get_or_create(
+            user=user,
+            defaults={"role": role, "phone": phone, "city": city}
+        )
+        if avatar:
+            profile.profile_image = avatar[:500] if len(avatar) < 500 else avatar
+        if phone:
+            profile.phone = phone
+        if city:
+            profile.city = city
+        if role == "shooter":
+            profile.role = "shooter"
+        profile.save()
+
+        return Response({
+            "email": email,
+            "display_name": display_name or user.get_full_name() or user.username,
+            "name": display_name or user.get_full_name() or user.username,
+            "avatar": profile.profile_image or "",
+            "phone": profile.phone or "",
+            "city": profile.city or "",
+            "role": "creator" if profile.role == "shooter" else "user",
+            "message": "User profile synced successfully.",
+        }, status=status.HTTP_200_OK)
+
+
+class CreatorCategoryViewSet(viewsets.ReadOnlyModelViewSet):
+    """Public read-only endpoint — returns only active categories ordered by sort_order."""
+
+    queryset = CreatorCategory.objects.filter(is_active=True)
+    serializer_class = CreatorCategorySerializer
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+
+class PackageViewSet(viewsets.ModelViewSet):
+    """
+    CRUD for a creator's service packages.
+    GET /api/packages/?shooter={id}  — public
+    POST/PATCH/DELETE — shooter auth required (owner only)
+    """
+
+    serializer_class = PackageSerializer
+
+    def get_permissions(self):
+        if self.action in ("list", "retrieve"):
+            return [AllowAny()]
+        return [IsAuthenticated()]
+
+    def get_queryset(self):
+        shooter_id = self.request.query_params.get("shooter")
+        if shooter_id:
+            if not str(shooter_id).strip().isdigit():
+                return Package.objects.none()
+            return Package.objects.filter(shooter_id=int(shooter_id))
+        return Package.objects.all()
+
+    def perform_create(self, serializer):
+        profile = getattr(self.request.user, "profile", None)
+        if not profile or profile.role != "shooter":
+            raise DRFPermissionDenied("Only creators can create packages.")
+        shooter, _ = ShooterProfile.objects.get_or_create(
+            user=profile,
+            defaults={
+                "display_name": self.request.user.get_full_name() or self.request.user.username or "Creator",
+                "city": profile.city or "",
+                "hourly_price": Decimal("799.00"),
+            },
+        )
+        serializer.save(shooter=shooter)
+
+    def perform_update(self, serializer):
+        # Only the package owner can update
+        pkg = self.get_object()
+        profile = getattr(self.request.user, "profile", None)
+        if (profile and hasattr(profile, "shooter_profile") and pkg.shooter == profile.shooter_profile) or self.request.user.is_staff:
+            serializer.save()
+        else:
+            raise DRFPermissionDenied("You can only edit your own packages.")
+
+    def perform_destroy(self, instance):
+        profile = getattr(self.request.user, "profile", None)
+        if (profile and hasattr(profile, "shooter_profile") and instance.shooter == profile.shooter_profile) or self.request.user.is_staff:
+            instance.delete()
+        else:
+            raise DRFPermissionDenied("You can only delete your own packages.")
+
+
+class ShooterViewSet(viewsets.ModelViewSet):
+
+    queryset = ShooterProfile.objects.select_related(
+        "user", "user__user"
+    ).prefetch_related(
+        "packages_set", "portfolio_photos", "reviews_received"
+    ).all()
+
+    serializer_class = ShooterProfileSerializer
+
+    def get_permissions(self):
+        if self.action in [
+            "list",
+            "retrieve",
+        ]:
+            return [AllowAny()]
+
+        return [IsAuthenticated()]
+
+    def get_queryset(self):
+        queryset = ShooterProfile.objects.select_related(
+            "user", "user__user"
+        ).prefetch_related(
+            "packages_set", "portfolio_photos", "reviews_received"
+        ).all()
+
+        city = self.request.query_params.get("city")
+        category = self.request.query_params.get("category")
+        available = self.request.query_params.get("available")
+
+        if city:
+            queryset = queryset.filter(city__iexact=city)
+
+        if available == "true":
+            queryset = queryset.filter(is_available=True)
+
+        if category:
+            queryset = queryset.filter(
+                Q(category__iexact=category) | Q(shooting_styles__contains=[category])
+            )
+
+        # Exclude incomplete/test accounts: Firebase UIDs are 28-char alphanumeric
+        # strings with no spaces. Filter them out from public listings.
+        import re as _re
+        _uid_pattern = _re.compile(r'^[A-Za-z0-9]{20,}$')
+        valid_ids = [
+            sp_id for (sp_id, sp_name, sp_city) in queryset.values_list("id", "display_name", "city")
+            if sp_name and not _uid_pattern.match(sp_name) and sp_city and sp_city.strip()
+        ]
+        return queryset.filter(id__in=valid_ids)
+
+
+
+
+
+class PortfolioPhotoViewSet(viewsets.ModelViewSet):
+
+    queryset = PortfolioPhoto.objects.select_related(
+        "shooter"
+    ).all()
+
+    serializer_class = PortfolioPhotoSerializer
+
+    def get_permissions(self):
+
+        if self.action in [
+            "list",
+            "retrieve",
+        ]:
+            return [AllowAny()]
+
+        return [IsAuthenticated()]
+
+    def perform_create(self, serializer):
+
+        profile = get_object_or_404(
+            UserProfile,
+            user=self.request.user,
+            role="shooter",
+        )
+
+        shooter = get_object_or_404(
+            ShooterProfile,
+            user=profile,
+        )
+
+        serializer.save(shooter=shooter)
+
+    def get_queryset(self):
+
+        queryset = self.queryset
+
+        shooter_id = self.request.query_params.get(
+            "shooter"
+        )
+
+        if shooter_id:
+            queryset = queryset.filter(
+                shooter_id=shooter_id
+            )
+
+        return queryset.filter(
+            is_public=True
+        )
+
+
+
+class AvailabilityViewSet(viewsets.ModelViewSet):
+
+    serializer_class = AvailabilitySerializer
+
+    permission_classes = [
+        IsAuthenticated,
+        IsShooter,
+    ]
+
+    def get_queryset(self):
+
+        profile = get_object_or_404(
+            UserProfile,
+            user=self.request.user,
+        )
+
+        shooter = get_object_or_404(
+            ShooterProfile,
+            user=profile,
+        )
+
+        return Availability.objects.filter(
+            shooter=shooter
+        )
+
+    def perform_create(self, serializer):
+
+        profile = get_object_or_404(
+            UserProfile,
+            user=self.request.user,
+        )
+
+        shooter = get_object_or_404(
+            ShooterProfile,
+            user=profile,
+        )
+
+        serializer.save(
+            shooter=shooter
+        )
+
+
+class BookingViewSet(viewsets.ModelViewSet):
+
+    serializer_class = BookingSerializer
+
+    permission_classes = [IsAuthenticated]
+
+    def get_queryset(self):
+        # Allow detail actions to resolve the object and enforce explicit 403 ownership checks
+        if self.action in ("confirm", "cancel", "complete"):
+            return Booking.objects.select_related(
+                "customer", "customer__user", "shooter", "shooter__user", "shooter__user__user"
+            ).all()
+
+        user = self.request.user
+        if not user or not user.is_authenticated:
+            return Booking.objects.none()
+
+        profile = getattr(user, "profile", None)
+        if not profile:
+            try:
+                profile = UserProfile.objects.get(user=user)
+            except UserProfile.DoesNotExist:
+                profile = None
+
+        if profile:
+            if profile.role == "customer":
+                return Booking.objects.filter(
+                    Q(customer=profile) | (Q(customer__user__email__iexact=user.email) if user.email else Q())
+                ).select_related(
+                    "customer", "customer__user", "shooter", "shooter__user", "shooter__user__user"
+                ).order_by("-created_at")
+            if profile.role == "shooter":
+                return Booking.objects.filter(
+                    Q(shooter__user=profile) | (Q(shooter__user__user__email__iexact=user.email) if user.email else Q())
+                ).select_related(
+                    "customer", "customer__user", "shooter", "shooter__user", "shooter__user__user"
+                ).order_by("-created_at")
+
+        # Fallback for authenticated users matched by email
+        if user.email:
+            return Booking.objects.filter(
+                Q(customer__user__email__iexact=user.email) |
+                Q(shooter__user__user__email__iexact=user.email)
+            ).select_related(
+                "customer", "customer__user", "shooter", "shooter__user", "shooter__user__user"
+            ).order_by("-created_at")
+
+        return Booking.objects.none()
+
+    def create(self, request, *args, **kwargs):
+        # Allow passing flexible booking data from the frontend
+        data = request.data.copy() if hasattr(request.data, "copy") else dict(request.data)
+
+        # 1. Resolve shooter
+        shooter_id = data.get("shooter") or data.get("shooter_id")
+        shooter = None
+        if shooter_id:
+            try:
+                shooter = ShooterProfile.objects.filter(id=int(shooter_id)).first()
+            except (ValueError, TypeError):
+                clean_name = str(shooter_id).replace("creator-", "").replace("-", " ").strip()
+                shooter = ShooterProfile.objects.filter(display_name__icontains=clean_name).first()
+        if not shooter:
+            shooter = ShooterProfile.objects.first()
+        if not shooter:
+            default_user, _ = User.objects.get_or_create(
+                username="default_creator",
+                defaults={"first_name": "Frambit", "last_name": "Creator", "email": "creator@frambit.com"}
+            )
+            default_prof, _ = UserProfile.objects.get_or_create(
+                user=default_user,
+                defaults={"role": "shooter", "city": "Bengaluru"}
+            )
+            shooter, _ = ShooterProfile.objects.get_or_create(
+                user=default_prof,
+                defaults={"display_name": "Frambit Creator", "city": "", "category": "reel_shooter", "hourly_price": Decimal("2500.00")}
+            )
+        data["shooter"] = shooter.id
+
+        # 2. Resolve booking date
+        raw_date = data.get("booking_date")
+        clean_date = None
+        if raw_date:
+            raw_str = str(raw_date).strip()
+            for fmt in ("%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%d/%m/%Y", "%m/%d/%Y"):
+                try:
+                    clean_date = datetime.datetime.strptime(raw_str, fmt).date()
+                    break
+                except (ValueError, TypeError):
+                    continue
+        if not clean_date:
+            clean_date = datetime.date.today() + datetime.timedelta(days=1)
+        data["booking_date"] = clean_date.isoformat()
+
+        # 3. Resolve start time
+        raw_time = data.get("start_time")
+        clean_time = None
+        if raw_time:
+            time_str = str(raw_time).strip()
+            if " - " in time_str:
+                time_str = time_str.split(" - ")[0].strip()
+            for fmt in ("%H:%M:%S", "%H:%M", "%I:%M %p", "%I:%M%p"):
+                try:
+                    clean_time = datetime.datetime.strptime(time_str, fmt).time()
+                    break
+                except (ValueError, TypeError):
+                    continue
+        if not clean_time:
+            clean_time = datetime.time(16, 0)
+        data["start_time"] = clean_time.strftime("%H:%M:%S")
+
+        # 4. Resolve estimated amount
+        duration = int(data.get("duration_minutes", 60) or 60)
+        raw_amount = data.get("estimated_amount") or data.get("amount")
+        if raw_amount:
+            try:
+                clean_amt = str(raw_amount).replace("₹", "").replace(",", "").strip()
+                amount = Decimal(clean_amt)
+            except Exception:
+                amount = calculate_booking_amount(shooter, duration) if shooter else Decimal("4999.00")
+        else:
+            amount = calculate_booking_amount(shooter, duration) if shooter else Decimal("4999.00")
+        data["estimated_amount"] = str(amount)
+
+        # 5. Resolve location and notes
+        data["location"] = data.get("location") or "Indiranagar, Bangalore"
+        data["notes"] = data.get("notes") or data.get("service") or data.get("requirements") or ""
+
+        # 6. Resolve customer profile
+        user = request.user
+        profile = None
+        if user and user.is_authenticated:
+            try:
+                profile = UserProfile.objects.get(user=user)
+            except UserProfile.DoesNotExist:
+                pass
+        if not profile:
+            client_email = (
+                data.get("client_email")
+                or data.get("customer_email")
+                or "guest@frambit.com"
+            )
+            client_name = (
+                data.get("client_name")
+                or data.get("customer_name")
+                or "Client"
+            )
+            profile = get_or_create_client_profile(client_email, client_name)
+
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save(
+            customer=profile,
+            shooter=shooter,
+            booking_date=clean_date,
+            start_time=clean_time,
+            location=data["location"],
+            notes=data["notes"],
+            estimated_amount=amount,
+        )
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        profile = None
+
+        if user and user.is_authenticated:
+            try:
+                profile = UserProfile.objects.get(user=user)
+            except UserProfile.DoesNotExist:
+                pass
+
+        if not profile:
+            client_email = (
+                self.request.data.get("client_email")
+                or self.request.data.get("customer_email")
+                or "guest@frambit.com"
+            )
+            client_name = (
+                self.request.data.get("client_name")
+                or self.request.data.get("customer_name")
+                or "Client"
+            )
+            profile = get_or_create_client_profile(client_email, client_name)
+
+        shooter_id = self.request.data.get("shooter") or self.request.data.get("shooter_id")
+        shooter = None
+        if shooter_id:
+            shooter = ShooterProfile.objects.filter(id=shooter_id).first()
+        if not shooter:
+            shooter = ShooterProfile.objects.first()
+
+        duration = int(self.request.data.get("duration_minutes", 60))
+        raw_amount = self.request.data.get("estimated_amount") or self.request.data.get("amount")
+        if raw_amount:
+            try:
+                clean_amt = str(raw_amount).replace("₹", "").replace(",", "").strip()
+                amount = Decimal(clean_amt)
+            except Exception:
+                amount = calculate_booking_amount(shooter, duration) if shooter else Decimal("4999.00")
+        else:
+            amount = calculate_booking_amount(shooter, duration) if shooter else Decimal("4999.00")
+
+        # Booking date handling
+        booking_date = self.request.data.get("booking_date")
+        if not booking_date or booking_date == "Tomorrow" or "Sep" in str(booking_date):
+            booking_date = datetime.date.today() + datetime.timedelta(days=1)
+
+        start_time = self.request.data.get("start_time")
+        if not start_time or ":" not in str(start_time):
+            start_time = datetime.time(10, 0)
+        elif " - " in str(start_time):
+            first_part = str(start_time).split(" - ")[0].strip()
+            try:
+                start_time = datetime.datetime.strptime(first_part, "%I:%M %p").time()
+            except Exception:
+                start_time = datetime.time(16, 0)
+
+        location = self.request.data.get("location") or "Indiranagar, Bangalore"
+        notes = self.request.data.get("notes") or self.request.data.get("service") or self.request.data.get("requirements") or ""
+
+        serializer.save(
+            customer=profile,
+            shooter=shooter,
+            booking_date=booking_date,
+            start_time=start_time,
+            location=location,
+            notes=notes,
+            estimated_amount=amount,
+        )
+
+    def _check_booking_ownership(self, request, booking):
+        """Raise 403 unless the requester is the booking's customer or shooter."""
+        if not request.user or not request.user.is_authenticated:
+            raise DRFPermissionDenied("Authentication required to modify bookings.")
+        try:
+            profile = UserProfile.objects.get(user=request.user)
+        except UserProfile.DoesNotExist:
+            raise DRFPermissionDenied("User profile not found.")
+        is_customer = booking.customer == profile
+        is_shooter = hasattr(profile, 'shooter_profile') and booking.shooter == profile.shooter_profile
+        if not (is_customer or is_shooter or request.user.is_staff):
+            raise DRFPermissionDenied("You do not have permission to modify this booking.")
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated])
+    def confirm(self, request, pk=None):
+        booking = self.get_object()
+        self._check_booking_ownership(request, booking)
+        booking.status = "confirmed"
+        booking.save(update_fields=["status"])
+        return Response(BookingSerializer(booking).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated])
+    def cancel(self, request, pk=None):
+        booking = self.get_object()
+        self._check_booking_ownership(request, booking)
+        booking.status = "cancelled"
+        booking.save(update_fields=["status"])
+        return Response(BookingSerializer(booking).data)
+
+    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated])
+    def complete(self, request, pk=None):
+        booking = self.get_object()
+        self._check_booking_ownership(request, booking)
+        booking.status = "completed"
+        booking.save(update_fields=["status"])
+        increment_shooter_bookings(booking.shooter)
+        return Response(BookingSerializer(booking).data)
+
+
+class ReviewViewSet(viewsets.ModelViewSet):
+
+    serializer_class = ReviewSerializer
+
+    def get_permissions(self):
+        """Public list/retrieve, authenticated create/update/destroy."""
+        if self.action in ("list", "retrieve"):
+            return [AllowAny()]
+        return [IsAuthenticated()]
+
+    def get_queryset(self):
+        shooter_id = self.request.query_params.get("shooter") or self.request.query_params.get("shooter_id")
+        if shooter_id:
+            if not str(shooter_id).strip().isdigit():
+                return Review.objects.none()
+            return Review.objects.filter(shooter_id=int(shooter_id)).select_related(
+                "customer", "customer__user", "shooter"
+            ).order_by("-created_at")
+        return Review.objects.select_related(
+            "customer", "customer__user", "shooter"
+        ).all().order_by("-created_at")
+
+    def create(self, request, *args, **kwargs):
+        from rest_framework.exceptions import PermissionDenied
+
+        data = request.data.copy() if hasattr(request.data, "copy") else dict(request.data)
+
+        # 1. Resolve booking ID
+        raw_booking = data.get("booking") or data.get("booking_id")
+        clean_booking_id = None
+        if raw_booking is not None:
+            clean_str = str(raw_booking).replace("BK-", "").strip()
+            if clean_str.isdigit():
+                clean_booking_id = int(clean_str)
+
+        booking = None
+        if clean_booking_id:
+            booking = Booking.objects.filter(id=clean_booking_id).first()
+
+        # 2. Resolve client / customer UserProfile
+        user = request.user
+        profile = None
+        if user and user.is_authenticated:
+            try:
+                profile = UserProfile.objects.get(user=user)
+            except UserProfile.DoesNotExist:
+                pass
+            passed_name = (data.get("customer_name") or data.get("client_name") or "").strip()
+            if passed_name and passed_name.lower() != "client" and not (len(passed_name) >= 20 and " " not in passed_name):
+                if not user.first_name or (len(user.first_name) >= 20 and " " not in user.first_name):
+                    user.first_name = passed_name[:150]
+                    user.save(update_fields=["first_name"])
+
+        if not profile:
+            if booking and booking.customer:
+                profile = booking.customer
+            else:
+                client_name = data.get("customer_name") or data.get("client_name") or "Client"
+                client_email = data.get("client_email") or f"client_{int(clean_booking_id or 1)}@frambit.com"
+                profile = get_or_create_client_profile(client_email, client_name)
+
+        # 3. Resolve ShooterProfile
+        shooter = None
+        if booking and booking.shooter:
+            shooter = booking.shooter
+        raw_shooter = data.get("shooter") or data.get("shooter_id")
+        if not shooter and raw_shooter is not None:
+            clean_s = str(raw_shooter).replace("creator-", "").strip()
+            if clean_s.isdigit():
+                shooter = ShooterProfile.objects.filter(id=int(clean_s)).first()
+        if not shooter:
+            shooter = ShooterProfile.objects.first()
+
+        # Prevent creator from self-reviewing
+        if profile and shooter and shooter.user == profile:
+            raise PermissionDenied({"detail": "Creators cannot review themselves."})
+
+        # 4. Guarantee completed booking instance for OneToOne relation
+        if not booking:
+            booking = Booking.objects.create(
+                customer=profile,
+                shooter=shooter,
+                booking_date=datetime.date.today(),
+                start_time=datetime.time(10, 0),
+                duration_minutes=60,
+                location=shooter.city or "",
+                notes="Completed Shoot",
+                estimated_amount=Decimal("1999.00"),
+                status="completed",
+            )
+        else:
+            if booking.status != "completed":
+                booking.status = "completed"
+                booking.save(update_fields=["status"])
+
+        # 5. Check if a review already exists for this booking (Upsert)
+        existing_review = Review.objects.filter(booking=booking).first()
+
+        rating_val = int(data.get("rating") or 5)
+        comment_val = (data.get("comment") or "").strip() or "Great shoot experience and high-quality reel delivery!"
+
+        if existing_review:
+            existing_review.rating = rating_val
+            existing_review.comment = comment_val
+            existing_review.save(update_fields=["rating", "comment"])
+            review = existing_review
+        else:
+            review = Review.objects.create(
+                booking=booking,
+                customer=profile,
+                shooter=shooter,
+                rating=rating_val,
+                comment=comment_val,
+            )
+
+        if shooter:
+            update_shooter_rating(shooter)
+
+        serializer = self.get_serializer(review)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+
+class SavedShooterViewSet(viewsets.ModelViewSet):
+
+    serializer_class = SavedShooterSerializer
+
+    permission_classes = [
+        IsAuthenticated,
+        IsCustomer,
+    ]
+
+    def get_queryset(self):
+
+        profile = get_object_or_404(
+            UserProfile,
+            user=self.request.user,
+        )
+
+        return SavedShooter.objects.filter(
+            customer=profile
+        )
+
+    def perform_create(self, serializer):
+
+        profile = get_object_or_404(
+            UserProfile,
+            user=self.request.user,
+        )
+
+        serializer.save(
+            customer=profile
+        )
+
+
+class UserProfileViewSet(viewsets.ModelViewSet):
+
+    serializer_class = UserProfileSerializer
+
+    permission_classes = [
+        IsAuthenticated,
+    ]
+
+    def get_queryset(self):
+
+        return UserProfile.objects.filter(
+            user=self.request.user
+        )
+
+    def perform_create(self, serializer):
+
+        serializer.save(
+            user=self.request.user
+        )
+
+
+class ImageKitAuthView(APIView):
+    """
+    API view to generate authentication parameters for client-side ImageKit upload SDKs.
+    """
+    permission_classes = [AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'upload'
+
+    def get(self, request):
+        try:
+            auth_params = ImageKitService.get_auth_parameters()
+            return Response(auth_params, status=status.HTTP_200_OK)
+        except Exception as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ImageKitUploadView(APIView):
+    """
+    API view for server-side media upload (images and videos) to ImageKit.
+    Accepts multipart file upload or JSON payload containing a file URL / base64 string.
+    """
+    permission_classes = [AllowAny]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'upload'
+
+    def post(self, request):
+        file_obj = request.FILES.get("file") or request.data.get("file")
+        if not file_obj:
+            return Response(
+                {"detail": "No file or URL provided under key 'file'."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        file_name = request.data.get("file_name") or getattr(file_obj, "name", "upload_file")
+        folder = request.data.get("folder", "/uploads")
+        use_unique = request.data.get("use_unique_file_name")
+        use_unique_bool = True if use_unique in ("true", True, "True") else False
+
+        try:
+            res = ImageKitService.upload_file(
+                file_data=file_obj,
+                file_name=file_name,
+                folder=folder,
+                use_unique_file_name=use_unique_bool,
+            )
+            return Response(res, status=status.HTTP_201_CREATED)
+        except Exception as exc:
+            import traceback
+            print("--- IMAGEKIT UPLOAD EXCEPTION ---")
+            traceback.print_exc()
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+
+class PromotionalBannerViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Public endpoint returning active promotional banners configured by Admin.
+    GET /api/banners/
+    """
+    queryset = PromotionalBanner.objects.filter(is_active=True).order_by("order", "id")
+    serializer_class = PromotionalBannerSerializer
+    permission_classes = [AllowAny]
+    authentication_classes = []
+
+

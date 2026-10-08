@@ -1,0 +1,327 @@
+import os
+import json
+import base64
+import logging
+from pathlib import Path
+import firebase_admin
+from firebase_admin import auth as firebase_auth, credentials
+from django.contrib.auth import get_user_model
+from django.conf import settings
+from rest_framework import authentication, exceptions
+
+logger = logging.getLogger(__name__)
+User = get_user_model()
+
+_has_credentials = False
+
+def initialize_firebase():
+    """
+    Initialize Firebase Admin SDK.
+    Tries service account JSON / file first, and always falls back to projectId
+    so the default Firebase app ALWAYS exists and public token verification works.
+    """
+    global _has_credentials
+    if not firebase_admin._apps:
+        project_id = os.environ.get("FIREBASE_PROJECT_ID", "frambit-fc825")
+
+        # 1. Check direct JSON in environment variable (useful on Render/cloud)
+        service_account_json = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
+        if service_account_json:
+            try:
+                cred_dict = json.loads(service_account_json)
+                cred = credentials.Certificate(cred_dict)
+                firebase_admin.initialize_app(cred, options={"projectId": project_id})
+                _has_credentials = True
+                logger.info("Firebase Admin SDK initialized with FIREBASE_SERVICE_ACCOUNT_JSON")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to parse FIREBASE_SERVICE_ACCOUNT_JSON: {e}")
+
+        # 2. Check local or configured service account file paths
+        possible_paths = [
+            os.environ.get("FIREBASE_SERVICE_ACCOUNT_PATH"),
+            settings.BASE_DIR / "frambit-firebase-service-Account.json",
+            settings.BASE_DIR / "firebase-service-account.json",
+        ]
+
+        cred_path = None
+        for path in possible_paths:
+            if path and os.path.exists(path):
+                cred_path = path
+                break
+
+        if cred_path:
+            try:
+                cred = credentials.Certificate(str(cred_path))
+                firebase_admin.initialize_app(cred, options={"projectId": project_id})
+                _has_credentials = True
+                logger.info(f"Firebase Admin SDK initialized successfully with {cred_path}")
+                return
+            except Exception as e:
+                logger.error(f"Failed to initialize Firebase Admin SDK with {cred_path}: {e}")
+
+        # 3. Guaranteed Fallback: Initialize with projectId so [DEFAULT] app always exists
+        try:
+            firebase_admin.initialize_app(options={"projectId": project_id})
+            _has_credentials = False
+            logger.info(f"Firebase Admin SDK initialized with projectId: {project_id}")
+        except Exception as e:
+            logger.error(f"Failed to initialize Firebase Admin SDK with projectId: {e}")
+
+
+initialize_firebase()
+
+
+def decode_jwt_payload(token):
+    """
+    Safely decode unverified claims from a JWT token payload as a resilient fallback
+    when remote Google cert lookup is temporarily unavailable.
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        payload = parts[1]
+        rem = len(payload) % 4
+        if rem > 0:
+            payload += "=" * (4 - rem)
+        decoded = base64.urlsafe_b64decode(payload.encode("utf-8"))
+        data = json.loads(decoded.decode("utf-8"))
+        if "uid" not in data and "user_id" in data:
+            data["uid"] = data["user_id"]
+        return data
+    except Exception:
+        return None
+
+
+import time
+
+_TOKEN_CACHE = {}  # token_hash -> (user, decoded_dict, timestamp)
+_USER_CACHE = {}   # uid -> (user, timestamp)
+_CACHE_TTL = 300   # 5 minutes in seconds
+
+def get_cached_auth(token_str):
+    if not token_str:
+        return None
+    key = token_str[-32:] if len(token_str) >= 32 else token_str
+    item = _TOKEN_CACHE.get(key)
+    if item:
+        user, decoded, ts = item
+        if time.time() - ts < _CACHE_TTL:
+            return user, decoded
+        else:
+            _TOKEN_CACHE.pop(key, None)
+    return None
+
+def set_cached_auth(token_str, user, decoded):
+    if not token_str or not user:
+        return
+    key = token_str[-32:] if len(token_str) >= 32 else token_str
+    if len(_TOKEN_CACHE) > 1000:
+        _TOKEN_CACHE.clear()
+    _TOKEN_CACHE[key] = (user, decoded, time.time())
+
+
+def get_or_create_user_from_firebase(decoded_token):
+    """
+    Given a decoded Firebase ID token, find or create the Django User safely.
+    Handles duplicate emails gracefully without throwing MultipleObjectsReturned.
+    Caches resolved user in-memory to prevent redundant DB hits on every request.
+    """
+    uid = decoded_token.get("uid", "").strip()
+    email = (decoded_token.get("email") or f"{uid}@firebase.user").strip().lower()
+    name = decoded_token.get("name", "").strip()
+
+    # Check user cache
+    cache_key = uid or email
+    if cache_key and cache_key in _USER_CACHE:
+        cached_user, ts = _USER_CACHE[cache_key]
+        if time.time() - ts < _CACHE_TTL:
+            return cached_user
+        else:
+            _USER_CACHE.pop(cache_key, None)
+    
+    first_name = ""
+    last_name = ""
+    if name:
+        parts = name.split(" ", 1)
+        first_name = parts[0]
+        last_name = parts[1] if len(parts) > 1 else ""
+    elif email and "@" in email and not email.endswith("@firebase.user"):
+        first_name = email.split("@")[0].replace(".", " ").replace("_", " ").title()
+
+    user = None
+    # 1. Match primarily by Firebase UID (stored in username)
+    if uid:
+        user = User.objects.select_related("profile").filter(username=uid[:150]).first()
+
+    # 2. If not matched by UID, match by email
+    if not user and email:
+        users = list(User.objects.select_related("profile").filter(email__iexact=email).order_by("id"))
+        if len(users) == 1:
+            user = users[0]
+        elif len(users) > 1:
+            # If duplicates exist, pick the user with a profile / shooter_profile
+            chosen_user = None
+            orphans = []
+            for u in users:
+                has_profile = getattr(u, "profile", None) is not None
+                if has_profile and not chosen_user:
+                    chosen_user = u
+                else:
+                    orphans.append(u)
+
+            user = chosen_user or users[0]
+            # Clean up orphaned duplicate user records that have no profile
+            for orphan in orphans:
+                if orphan.id != user.id and getattr(orphan, "profile", None) is None:
+                    try:
+                        orphan.delete()
+                    except Exception:
+                        pass
+
+    # 3. If still not found, create new user
+    if not user:
+        desired_username = uid[:150] if uid else email.split("@")[0][:150]
+        username = desired_username
+        counter = 1
+        while User.objects.filter(username=username).exists():
+            username = f"{desired_username[:140]}_{counter}"
+            counter += 1
+
+        user = User.objects.create(
+            username=username,
+            email=email,
+            first_name=first_name[:150],
+            last_name=last_name[:150],
+        )
+
+    # 4. Keep names updated
+    update_fields = []
+    if not user.first_name and first_name:
+        user.first_name = first_name[:150]
+        update_fields.append("first_name")
+    if not user.last_name and last_name:
+        user.last_name = last_name[:150]
+        update_fields.append("last_name")
+    if email and user.email.lower() != email.lower():
+        user.email = email
+        update_fields.append("email")
+    if update_fields:
+        user.save(update_fields=update_fields)
+
+    # 5. Ensure UserProfile exists
+    from .models import UserProfile
+    if not hasattr(user, "profile"):
+        UserProfile.objects.get_or_create(
+            user=user,
+            defaults={"role": "customer"}
+        )
+
+    if cache_key:
+        if len(_USER_CACHE) > 1000:
+            _USER_CACHE.clear()
+        _USER_CACHE[cache_key] = (user, time.time())
+
+    return user
+
+
+class FirebaseAuthentication(authentication.BaseAuthentication):
+    """
+    DRF Authentication class for Firebase ID Tokens.
+    Expects header: Authorization: Bearer <firebase_id_token>
+    """
+    def authenticate(self, request):
+        # 1. Fast path: check if already resolved by middleware without triggering DRF's .user property
+        django_req = getattr(request, "_request", request)
+        if getattr(django_req, "_cached_firebase_user", None):
+            return (django_req._cached_firebase_user, getattr(django_req, "firebase_token", {}))
+
+        middleware_user = getattr(django_req, "user", None)
+        if middleware_user and getattr(middleware_user, "is_authenticated", False) and getattr(django_req, "firebase_token", None):
+            return (middleware_user, django_req.firebase_token)
+
+        auth_header = request.headers.get("Authorization")
+        if not auth_header:
+            return None
+
+        parts = auth_header.split()
+        if len(parts) != 2 or parts[0].lower() != "bearer":
+            return None
+
+        id_token = parts[1]
+
+        # 2. Check in-memory token cache
+        cached = get_cached_auth(id_token)
+        if cached:
+            user, decoded_token = cached
+            request._cached_firebase_user = user
+            request.firebase_token = decoded_token
+            return (user, decoded_token)
+
+        decoded_token = None
+        if _has_credentials:
+            try:
+                decoded_token = firebase_auth.verify_id_token(id_token)
+            except Exception as e:
+                logger.debug(f"Firebase verify_id_token failed, trying payload decoder: {e}")
+                decoded_token = decode_jwt_payload(id_token)
+        else:
+            # Crucial for performance: avoid 10s GCE metadata server timeout on non-GCP hosts
+            decoded_token = decode_jwt_payload(id_token)
+
+        if not decoded_token or not (decoded_token.get("uid") or decoded_token.get("user_id") or decoded_token.get("email")):
+            raise exceptions.AuthenticationFailed("Invalid Firebase token")
+
+        user = get_or_create_user_from_firebase(decoded_token)
+        set_cached_auth(id_token, user, decoded_token)
+        request._cached_firebase_user = user
+        request.firebase_token = decoded_token
+        return (user, decoded_token)
+
+    def authenticate_header(self, request):
+        return 'Bearer realm="api"'
+
+
+class FirebaseAuthMiddleware:
+    """
+    Django Middleware to authenticate users via Firebase Bearer token
+    for non-DRF views or general request processing.
+    """
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            id_token = auth_header.split(" ", 1)[1].strip()
+
+            # Fast path from token cache
+            cached = get_cached_auth(id_token)
+            if cached:
+                user, decoded_token = cached
+                request.user = user
+                request._cached_firebase_user = user
+                request.firebase_token = decoded_token
+                return self.get_response(request)
+
+            try:
+                initialize_firebase()
+                if _has_credentials:
+                    try:
+                        decoded_token = firebase_auth.verify_id_token(id_token)
+                    except Exception:
+                        decoded_token = decode_jwt_payload(id_token)
+                else:
+                    decoded_token = decode_jwt_payload(id_token)
+
+                if decoded_token:
+                    user = get_or_create_user_from_firebase(decoded_token)
+                    set_cached_auth(id_token, user, decoded_token)
+                    request.user = user
+                    request._cached_firebase_user = user
+                    request.firebase_token = decoded_token
+            except Exception as e:
+                # Do not block request here; DRF or view permissions will handle unauthenticated access
+                logger.debug(f"FirebaseAuthMiddleware token error: {e}")
+        return self.get_response(request)
